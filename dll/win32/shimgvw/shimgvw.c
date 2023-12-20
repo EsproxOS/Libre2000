@@ -59,6 +59,9 @@ static const TBBUTTON s_Buttons[] =
     DEFINE_BTN_INFO(ROT_CLOCKW),
     DEFINE_BTN_INFO(ROT_COUNCW),
     DEFINE_BTN_SEPARATOR,
+    DEFINE_BTN_INFO(ROT_CWSAVE),
+    DEFINE_BTN_INFO(ROT_CCWSAVE),
+    DEFINE_BTN_SEPARATOR,
     DEFINE_BTN_INFO(DELETE),
     DEFINE_BTN_INFO(PRINT),
     DEFINE_BTN_INFO(SAVEAS),
@@ -87,11 +90,13 @@ static const TB_BUTTON_CONFIG s_ButtonConfig[] =
     DEFINE_BTN_CONFIG(ZOOM_OUT),
     DEFINE_BTN_CONFIG(ROT_CLOCKW),
     DEFINE_BTN_CONFIG(ROT_COUNCW),
+    DEFINE_BTN_CONFIG(ROT_CWSAVE),
+    DEFINE_BTN_CONFIG(ROT_CCWSAVE),
     DEFINE_BTN_CONFIG(DELETE),
     DEFINE_BTN_CONFIG(PRINT),
     DEFINE_BTN_CONFIG(SAVEAS),
     DEFINE_BTN_CONFIG(MODIFY),
-    DEFINE_BTN_CONFIG(HELP_TOC)
+    DEFINE_BTN_CONFIG(HELP_TOC),
 };
 
 typedef struct tagPREVIEW_DATA
@@ -105,6 +110,8 @@ typedef struct tagPREVIEW_DATA
     INT m_yScrollOffset;
     UINT m_nMouseDownMsg;
     POINT m_ptOrigin;
+    IStream *m_pMemStream;
+    WCHAR m_szFile[MAX_PATH];
 } PREVIEW_DATA, *PPREVIEW_DATA;
 
 static inline PPREVIEW_DATA
@@ -328,7 +335,7 @@ Preview_UpdateTitle(PPREVIEW_DATA pData, LPCWSTR FileName)
 }
 
 static VOID
-Preview_pLoadImage(PPREVIEW_DATA pData, LPCWSTR szOpenFileName)
+Preview_pFreeImage(PPREVIEW_DATA pData)
 {
     Anime_FreeInfo(&pData->m_Anime);
 
@@ -338,27 +345,76 @@ Preview_pLoadImage(PPREVIEW_DATA pData, LPCWSTR szOpenFileName)
         g_pImage = NULL;
     }
 
-    /* check file presence */
-    if (!szOpenFileName || GetFileAttributesW(szOpenFileName) == 0xFFFFFFFF)
+    if (pData->m_pMemStream)
     {
-        DPRINT1("File %s not found!\n", szOpenFileName);
+        pData->m_pMemStream->lpVtbl->Release(pData->m_pMemStream);
+        pData->m_pMemStream = NULL;
+    }
+
+    pData->m_szFile[0] = UNICODE_NULL;
+}
+
+IStream* MemStreamFromFile(LPCWSTR pszFileName)
+{
+    HANDLE hFile;
+    DWORD dwFileSize, dwRead;
+    LPBYTE pbMemFile = NULL;
+    IStream *pStream;
+
+    hFile = CreateFileW(pszFileName, GENERIC_READ, FILE_SHARE_READ, NULL,
+                        OPEN_EXISTING, 0, NULL);
+    if (hFile == INVALID_HANDLE_VALUE)
+        return NULL;
+
+    dwFileSize = GetFileSize(hFile, NULL);
+    pbMemFile = QuickAlloc(dwFileSize, FALSE);
+    if (!dwFileSize || (dwFileSize == INVALID_FILE_SIZE) || !pbMemFile)
+    {
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    if (!ReadFile(hFile, pbMemFile, dwFileSize, &dwRead, NULL) || (dwRead != dwFileSize))
+    {
+        QuickFree(pbMemFile);
+        CloseHandle(hFile);
+        return NULL;
+    }
+
+    CloseHandle(hFile);
+    pStream = SHCreateMemStream(pbMemFile, dwFileSize);
+    QuickFree(pbMemFile);
+    return pStream;
+}
+
+static VOID
+Preview_pLoadImage(PPREVIEW_DATA pData, LPCWSTR szOpenFileName)
+{
+    Preview_pFreeImage(pData);
+
+    pData->m_pMemStream = MemStreamFromFile(szOpenFileName);
+    if (!pData->m_pMemStream)
+    {
+        DPRINT1("MemStreamFromFile() failed\n");
         Preview_UpdateTitle(pData, NULL);
         return;
     }
 
-    /* load now */
-    GdipLoadImageFromFile(szOpenFileName, &g_pImage);
+    /* NOTE: GdipLoadImageFromFile locks the file.
+             Avoid file locking by using GdipLoadImageFromStream and memory stream. */
+    GdipLoadImageFromStream(pData->m_pMemStream, &g_pImage);
     if (!g_pImage)
     {
-        DPRINT1("GdipLoadImageFromFile() failed\n");
+        DPRINT1("GdipLoadImageFromStream() failed\n");
+        Preview_pFreeImage(pData);
         Preview_UpdateTitle(pData, NULL);
         return;
     }
 
     Anime_LoadInfo(&pData->m_Anime);
 
-    if (szOpenFileName && szOpenFileName[0])
-        SHAddToRecentDocs(SHARD_PATHW, szOpenFileName);
+    SHAddToRecentDocs(SHARD_PATHW, szOpenFileName);
+    GetFullPathNameW(szOpenFileName, _countof(pData->m_szFile), pData->m_szFile, NULL);
 
     /* Reset zoom and redraw display */
     Preview_ResetZoom(pData);
@@ -370,6 +426,53 @@ static VOID
 Preview_pLoadImageFromNode(PPREVIEW_DATA pData, SHIMGVW_FILENODE *pNode)
 {
     Preview_pLoadImage(pData, (pNode ? pNode->FileName : NULL));
+}
+
+static BOOL
+Preview_pSaveImage(PPREVIEW_DATA pData, LPCWSTR pszFile)
+{
+    ImageCodecInfo *codecInfo;
+    GUID rawFormat;
+    UINT j, num, nFilterIndex, size;
+    BOOL ret = FALSE;
+
+    if (g_pImage == NULL)
+        return FALSE;
+
+    GdipGetImageEncodersSize(&num, &size);
+    codecInfo = QuickAlloc(size, FALSE);
+    if (!codecInfo)
+    {
+        DPRINT1("QuickAlloc() failed in pSaveImage()\n");
+        return FALSE;
+    }
+    GdipGetImageEncoders(num, size, codecInfo);
+
+    GdipGetImageRawFormat(g_pImage, &rawFormat);
+    if (IsEqualGUID(&rawFormat, &ImageFormatMemoryBMP))
+        rawFormat = ImageFormatBMP;
+
+    nFilterIndex = 0;
+    for (j = 0; j < num; ++j)
+    {
+        if (IsEqualGUID(&rawFormat, &codecInfo[j].FormatID))
+        {
+            nFilterIndex = j + 1;
+            break;
+        }
+    }
+
+    Anime_Pause(&pData->m_Anime);
+
+    ret = (nFilterIndex > 0) &&
+          (GdipSaveImageToFile(g_pImage, pszFile, &codecInfo[nFilterIndex - 1].Clsid, NULL) == Ok);
+    if (!ret)
+        DPRINT1("GdipSaveImageToFile() failed\n");
+
+    Anime_Start(&pData->m_Anime, 0);
+
+    QuickFree(codecInfo);
+    return ret;
 }
 
 static VOID
@@ -397,7 +500,10 @@ Preview_pSaveImageAs(PPREVIEW_DATA pData)
     }
 
     GdipGetImageEncoders(num, size, codecInfo);
+
     GdipGetImageRawFormat(g_pImage, &rawFormat);
+    if (IsEqualGUID(&rawFormat, &ImageFormatMemoryBMP))
+        rawFormat = ImageFormatBMP;
 
     sizeRemain = 0;
     for (j = 0; j < num; ++j)
@@ -444,13 +550,13 @@ Preview_pSaveImageAs(PPREVIEW_DATA pData)
         c++;
         sizeRemain -= sizeof(*c);
 
-        if (IsEqualGUID(&rawFormat, &codecInfo[j].FormatID) != FALSE)
+        if (IsEqualGUID(&rawFormat, &codecInfo[j].FormatID))
         {
             sfn.nFilterIndex = j + 1;
         }
     }
 
-    if (GetSaveFileNameW(&sfn))
+    if (GetSaveFileNameW(&sfn) && sfn.nFilterIndex > 0)
     {
         Anime_Pause(&pData->m_Anime);
 
@@ -1210,22 +1316,19 @@ Preview_Delete(PPREVIEW_DATA pData)
     HWND hwnd = pData->m_hwnd;
     SHFILEOPSTRUCTW FileOp = { hwnd, FO_DELETE };
 
-    if (!g_pCurrentFile)
+    if (!pData->m_szFile[0])
         return;
 
     /* FileOp.pFrom must be double-null-terminated */
-    GetFullPathNameW(g_pCurrentFile->FileName, _countof(szCurFile) - 1, szCurFile, NULL);
+    GetFullPathNameW(pData->m_szFile, _countof(szCurFile) - 1, szCurFile, NULL);
     szCurFile[_countof(szCurFile) - 2] = UNICODE_NULL; /* Avoid buffer overrun */
     szCurFile[lstrlenW(szCurFile) + 1] = UNICODE_NULL;
 
-    GetFullPathNameW(g_pCurrentFile->Next->FileName, _countof(szNextFile), szNextFile, NULL);
-    szNextFile[_countof(szNextFile) - 1] = UNICODE_NULL; /* Avoid buffer overrun */
-
-    /* FIXME: Our GdipLoadImageFromFile locks the image file */
-    if (g_pImage)
+    szNextFile[0] = UNICODE_NULL;
+    if (g_pCurrentFile)
     {
-        GdipDisposeImage(g_pImage);
-        g_pImage = NULL;
+        GetFullPathNameW(g_pCurrentFile->Next->FileName, _countof(szNextFile), szNextFile, NULL);
+        szNextFile[_countof(szNextFile) - 1] = UNICODE_NULL; /* Avoid buffer overrun */
     }
 
     /* Confirm file deletion and delete if allowed */
@@ -1234,8 +1337,6 @@ Preview_Delete(PPREVIEW_DATA pData)
     if (SHFileOperationW(&FileOp) != 0)
     {
         DPRINT("Preview_Delete: SHFileOperationW() failed or canceled\n");
-
-        Preview_pLoadImage(pData, szCurFile);
         return;
     }
 
@@ -1248,35 +1349,26 @@ Preview_Delete(PPREVIEW_DATA pData)
 static VOID
 Preview_Edit(HWND hwnd)
 {
-    WCHAR szPathName[MAX_PATH];
     SHELLEXECUTEINFOW sei;
+    PPREVIEW_DATA pData = Preview_GetData(hwnd);
 
-    if (!g_pCurrentFile)
+    if (!pData->m_szFile[0])
         return;
-
-    /* Avoid file locking */
-    /* FIXME: Our GdipLoadImageFromFile locks the image file */
-    if (g_pImage)
-    {
-        GdipDisposeImage(g_pImage);
-        g_pImage = NULL;
-    }
-
-    GetFullPathNameW(g_pCurrentFile->FileName, _countof(szPathName), szPathName, NULL);
-    szPathName[_countof(szPathName) - 1] = UNICODE_NULL; /* Avoid buffer overrun */
 
     ZeroMemory(&sei, sizeof(sei));
     sei.cbSize = sizeof(sei);
     sei.lpVerb = L"edit";
-    sei.lpFile = szPathName;
+    sei.lpFile = pData->m_szFile;
     sei.nShow = SW_SHOWNORMAL;
     if (!ShellExecuteExW(&sei))
     {
         DPRINT1("Preview_Edit: ShellExecuteExW() failed with code %ld\n", GetLastError());
     }
-
-    // Destroy the window to quit the application
-    DestroyWindow(hwnd);
+    else
+    {
+        // Destroy the window to quit the application
+        DestroyWindow(hwnd);
+    }
 }
 
 static VOID
@@ -1394,6 +1486,24 @@ Preview_OnCommand(HWND hwnd, UINT nCommandID)
             }
             break;
 
+        case IDC_ROT_CWSAVE:
+            if (g_pImage)
+            {
+                GdipImageRotateFlip(g_pImage, Rotate270FlipNone);
+                Preview_pSaveImage(pData, pData->m_szFile);
+                Preview_UpdateImage(pData);
+            }
+            break;
+
+        case IDC_ROT_CCWSAVE:
+            if (g_pImage)
+            {
+                GdipImageRotateFlip(g_pImage, Rotate90FlipNone);
+                Preview_pSaveImage(pData, pData->m_szFile);
+                Preview_UpdateImage(pData);
+            }
+            break;
+
         case IDC_DELETE:
             Preview_Delete(pData);
             Preview_UpdateImage(pData);
@@ -1435,13 +1545,7 @@ Preview_OnDestroy(HWND hwnd)
     pFreeFileList(g_pCurrentFile);
     g_pCurrentFile = NULL;
 
-    if (g_pImage)
-    {
-        GdipDisposeImage(g_pImage);
-        g_pImage = NULL;
-    }
-
-    Anime_FreeInfo(&pData->m_Anime);
+    Preview_pFreeImage(pData);
 
     SetWindowLongPtrW(pData->m_hwndZoom, GWLP_USERDATA, 0);
     DestroyWindow(pData->m_hwndZoom);
