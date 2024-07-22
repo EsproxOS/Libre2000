@@ -6,6 +6,6 @@ test out components of LibreXP operating system which is under devlopement
 on a more mature build system. 
 
 This Operating System has following purpose:-
-* Evolve Reactos faster with technologies from LibreXP
+* Evolve Reactos faster with technologies from Libre2000
 * Implement Early Version of NEOS NT Like Kernel on ROS
 
