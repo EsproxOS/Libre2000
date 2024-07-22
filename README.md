@@ -1,8 +1,8 @@
-ElectraOS named after Pleidies Star System, Electra is also Graphics Subsystem of LibreXP 
+ElectraOS named after Pleidies Star System, Electra is also Graphics Subsystem of Libre2000 
 Operating System..
 
 ElectraOS is Experimental operating System based on Reactos, purpose is to 
-test out components of LibreXP operating system which is under devlopement 
+test out components of Libre2000 operating system which is under devlopement 
 on a more mature build system. 
 
 This Operating System has following purpose:-
